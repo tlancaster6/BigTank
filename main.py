@@ -25,7 +25,7 @@ Example usage:
   python main.py projects/calibration_121125
   python main.py projects/calibration_121125 --no-board-image --quiet
   python main.py projects/calibration_121125 --no-visualizations
-  python main.py projects/calibration_121125 --max-frames 1000
+  python main.py projects/calibration_121125 --frame-step 5
         """
     )
 
@@ -61,10 +61,10 @@ Example usage:
     )
 
     parser.add_argument(
-        '--max-frames',
+        '--frame-step',
         type=int,
-        default=0,
-        help='Max frames for reprojection error analysis (default: 0, 0=all)'
+        default=10,
+        help='Sample every Nth frame for reprojection error analysis (default: 10). Lower values = more frames analyzed = slower but more thorough'
     )
 
     parser.add_argument(
@@ -90,7 +90,7 @@ Example usage:
     # Build visualization config from CLI args
     viz_config = {
         'frustum_scale': args.frustum_scale,
-        'max_frames': args.max_frames if args.max_frames > 0 else None,
+        'frame_step': args.frame_step,
     }
 
     # Run pipeline

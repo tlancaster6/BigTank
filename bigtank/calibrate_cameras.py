@@ -365,7 +365,7 @@ def calibrate_cameras(
     init_intrinsics: bool = True,
     init_extrinsics: bool = True,
     verbose: bool = True
-) -> CameraGroup:
+) -> Tuple[CameraGroup, float]:
     """
     Perform multi-camera calibration using aniposelib.
 
@@ -388,14 +388,15 @@ def calibrate_cameras(
 
     Returns
     -------
-    CameraGroup
-        Calibrated camera group
+    Tuple[CameraGroup, float]
+        - Calibrated camera group
+        - Bundle adjustment reprojection error (pixels)
     """
     # Create camera group
     cgroup = create_camera_group(cam_names, fisheye=fisheye)
 
-    # Perform calibration
-    cgroup.calibrate_videos(
+    # Perform calibration and capture bundle adjustment error
+    bundle_error = cgroup.calibrate_videos(
         video_lists,
         board,
         init_intrinsics=init_intrinsics,
@@ -403,7 +404,11 @@ def calibrate_cameras(
         verbose=verbose
     )
 
-    return cgroup
+    # calibrate_videos returns the final bundle adjustment error
+    if bundle_error is None:
+        bundle_error = 0.0
+
+    return cgroup, bundle_error
 
 
 # ============================================================================
@@ -523,7 +528,8 @@ def save_calibration_summary(
     camera_group: CameraGroup,
     config: dict,
     output_path: str,
-    reprojection_error: Optional[float] = None
+    bundle_adjustment_error: Optional[float] = None,
+    per_frame_validation_error: Optional[float] = None
 ) -> None:
     """
     Save formatted calibration summary to text file.
@@ -536,8 +542,10 @@ def save_calibration_summary(
         Configuration dictionary used for calibration
     output_path : str
         Path to save summary file (e.g., 'project_folder/output/calibration_summary.txt')
-    reprojection_error : float, optional
-        Mean reprojection error in pixels if available
+    bundle_adjustment_error : float, optional
+        Bundle adjustment reprojection error from calibration (pixels)
+    per_frame_validation_error : float, optional
+        Per-frame validation reprojection error using RANSAC (pixels)
     """
     from datetime import datetime
 
@@ -610,25 +618,34 @@ def save_calibration_summary(
             lines.append(f"{cam_name:<20} {width:>12} {height:>12}")
         lines.append("")
 
-    # Reprojection error
-    if reprojection_error is not None:
+    # Reprojection errors
+    if bundle_adjustment_error is not None or per_frame_validation_error is not None:
         lines.append("-" * 70)
         lines.append("CALIBRATION QUALITY")
         lines.append("-" * 70)
-        lines.append(f"Mean reprojection error:  {reprojection_error:.4f} pixels")
+
+        if bundle_adjustment_error is not None:
+            lines.append(f"Bundle adjustment error:      {bundle_adjustment_error:.4f} pixels")
+            lines.append("  (Optimization error from multi-camera calibration)")
+
+        if per_frame_validation_error is not None:
+            lines.append(f"Per-frame validation error:   {per_frame_validation_error:.4f} pixels")
+            lines.append("  (RANSAC validation using ITERATIVE solver, >=6 points)")
+
         lines.append("")
 
-        # Quality assessment
-        if reprojection_error < 0.5:
-            quality = "Excellent"
-        elif reprojection_error < 1.0:
-            quality = "Good"
-        elif reprojection_error < 2.0:
-            quality = "Acceptable"
-        else:
-            quality = "Poor - consider recalibration"
-        lines.append(f"Quality assessment:       {quality}")
-        lines.append("")
+        # Quality assessment based on bundle adjustment error (primary metric)
+        if bundle_adjustment_error is not None:
+            if bundle_adjustment_error < 0.5:
+                quality = "Excellent"
+            elif bundle_adjustment_error < 1.0:
+                quality = "Good"
+            elif bundle_adjustment_error < 2.0:
+                quality = "Acceptable"
+            else:
+                quality = "Poor - consider recalibration"
+            lines.append(f"Quality assessment:           {quality}")
+            lines.append("")
 
     lines.append("=" * 70)
 
@@ -916,7 +933,7 @@ def compute_reprojection_errors_per_frame(
     camera_group: CameraGroup,
     video_lists: List[List[str]],
     board,
-    max_frames: Optional[int] = None
+    frame_step: int = 1
 ) -> Tuple[np.ndarray, List[str], List[int]]:
     """
     Compute per-camera, per-frame reprojection errors from calibration videos.
@@ -929,8 +946,8 @@ def compute_reprojection_errors_per_frame(
         List of video lists (one per camera)
     board : CharucoBoard
         Board object for detection
-    max_frames : int, optional
-        Maximum number of frames to process (None for all frames)
+    frame_step : int, optional
+        Process every nth frame (default: 1 for all frames, 10 for every 10th frame)
 
     Returns
     -------
@@ -957,8 +974,10 @@ def compute_reprojection_errors_per_frame(
             if not ret:
                 break
 
-            if max_frames is not None and frame_idx >= max_frames:
-                break
+            # Process every frame_step-th frame
+            if frame_idx % frame_step != 0:
+                frame_idx += 1
+                continue
 
             # Detect board
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -1009,7 +1028,7 @@ def compute_reprojection_errors_per_frame(
             _, ids = detections[cam_idx]
             common_ids = common_ids.intersection(set(ids))
 
-        if len(common_ids) < 4:  # Need at least 4 points for triangulation
+        if len(common_ids) < 6:  # Need at least 6 points for robust RANSAC + ITERATIVE estimation
             continue
 
         common_ids = sorted(list(common_ids))
@@ -1048,26 +1067,33 @@ def compute_reprojection_errors_per_frame(
             points_detected_valid = points_detected[valid_mask]
             board_points_valid = board_points_3d[valid_mask]
 
-            # Need at least 4 points for solvePnP
-            if len(points_detected_valid) < 4:
+            # Need at least 6 points for RANSAC + ITERATIVE
+            if len(points_detected_valid) < 6:
                 continue
 
-            # Estimate board pose for this camera in this frame using solvePnP
-            # This gives us where the board actually is, not where the camera is
-            # Use SOLVEPNP_EPNP which works with 4+ points (ITERATIVE needs 6+)
+            # Estimate board pose using RANSAC + ITERATIVE for robustness
+            # RANSAC filters outlier corner detections, ITERATIVE refines the solution
             try:
-                success, rvec_board, tvec_board = cv2.solvePnP(
+                success, rvec_board, tvec_board, inliers = cv2.solvePnPRansac(
                     board_points_valid,
                     points_detected_valid,
                     cam.matrix,
                     cam.dist,
-                    flags=cv2.SOLVEPNP_EPNP if len(points_detected_valid) < 6 else cv2.SOLVEPNP_ITERATIVE
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                    reprojectionError=8.0,  # RANSAC inlier threshold (pixels)
+                    confidence=0.99
                 )
 
-                if not success:
+                if not success or inliers is None or len(inliers) < 6:
                     continue
+
+                # Use only inlier points for error calculation
+                inlier_indices = inliers.flatten()
+                points_detected_valid = points_detected_valid[inlier_indices]
+                board_points_valid = board_points_valid[inlier_indices]
+
             except cv2.error:
-                # If solvePnP fails, skip this frame
+                # If solvePnPRansac fails, skip this frame
                 continue
 
             # Project 3D board points using the estimated board pose
@@ -1097,7 +1123,8 @@ def plot_reprojection_error_heatmap(
     video_lists: List[List[str]],
     board,
     output_path: Optional[str] = None,
-    max_frames: Optional[int] = None,
+    frame_step: int = 1,
+    precomputed_errors: Optional[Tuple[np.ndarray, List[str], List[int]]] = None,
     figsize: Tuple[int, int] = (14, 8)
 ) -> plt.Figure:
     """
@@ -1118,8 +1145,10 @@ def plot_reprojection_error_heatmap(
         Board object for detection
     output_path : str, optional
         Path to save the figure (e.g., 'project_folder/output/reprojection_errors.png')
-    max_frames : int, optional
-        Maximum number of frames to process (None for all frames)
+    frame_step : int, optional
+        Process every nth frame (default: 1 for all frames, 10 for every 10th frame)
+    precomputed_errors : tuple, optional
+        Precomputed (error_matrix, camera_names, frame_indices) to avoid redundant computation
     figsize : tuple, optional
         Figure size (width, height) in inches (default: (14, 8))
 
@@ -1128,11 +1157,14 @@ def plot_reprojection_error_heatmap(
     plt.Figure
         Matplotlib figure object
     """
-    # Compute errors
-    print("Computing reprojection errors per frame...")
-    error_matrix, camera_names, frame_indices = compute_reprojection_errors_per_frame(
-        camera_group, video_lists, board, max_frames
-    )
+    # Use precomputed errors if available, otherwise compute
+    if precomputed_errors is not None:
+        error_matrix, camera_names, frame_indices = precomputed_errors
+    else:
+        print("Computing reprojection errors per frame...")
+        error_matrix, camera_names, frame_indices = compute_reprojection_errors_per_frame(
+            camera_group, video_lists, board, frame_step
+        )
 
     # Create figure with subplots
     fig = plt.figure(figsize=figsize)
@@ -1267,14 +1299,433 @@ def plot_reprojection_error_heatmap(
 
 
 # ============================================================================
-# 9. Pipeline Orchestration
+# 9. Coordinate Frame Reorientation
+# ============================================================================
+
+def detect_board_in_final_frames(
+    video_lists: List[List[str]],
+    board,
+    camera_group: CameraGroup,
+    duration_seconds: float = 3.0,
+    min_corners: int = 10
+) -> dict:
+    """
+    Detect calibration board in the final frames of calibration videos.
+
+    Parameters
+    ----------
+    video_lists : List[List[str]]
+        List of video lists (one per camera)
+    board : CharucoBoard
+        Board object for detection
+    camera_group : CameraGroup
+        Calibrated camera group
+    duration_seconds : float, optional
+        Duration in seconds to analyze from end of videos (default: 3.0)
+    min_corners : int, optional
+        Minimum number of corners required for valid detection (default: 10)
+
+    Returns
+    -------
+    dict
+        Dictionary mapping camera_idx to list of detections, where each detection is:
+        {
+            'frame_idx': int,
+            'corners_2d': np.ndarray (N, 2),
+            'ids': np.ndarray (N,),
+            'rvec': np.ndarray (3, 1),
+            'tvec': np.ndarray (3, 1)
+        }
+    """
+    all_detections = {}
+
+    for cam_idx, video_list in enumerate(video_lists):
+        video_path = video_list[0]
+        cam = camera_group.cameras[cam_idx]
+        cam_name = cam.get_name()
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"Warning: Could not open video {video_path}")
+            continue
+
+        # Get video properties
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Calculate frame range for final N seconds
+        frames_to_analyze = int(fps * duration_seconds)
+        start_frame = max(0, total_frames - frames_to_analyze)
+
+        # Seek to start frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        detections_for_cam = []
+        frame_idx = start_frame
+
+        while frame_idx < total_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Detect board
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            detection_result = board.detect_image(gray)
+
+            if detection_result is not None:
+                # Parse detection result
+                if isinstance(detection_result, tuple):
+                    corners_2d, ids = detection_result
+                    if corners_2d is not None and len(corners_2d) >= min_corners:
+                        corners_2d = corners_2d.reshape(-1, 2)
+                        ids = ids.flatten().astype(int)
+                    else:
+                        frame_idx += 1
+                        continue
+                else:
+                    if len(detection_result) >= min_corners:
+                        corners_2d = detection_result[:, :2]
+                        ids = detection_result[:, 2].astype(int)
+                    else:
+                        frame_idx += 1
+                        continue
+
+                # Get 3D board points for detected corners
+                board_points_3d = np.array([board.get_object_points()[cid] for cid in ids])
+
+                # Estimate board pose in camera coordinates
+                try:
+                    success, rvec, tvec = cv2.solvePnP(
+                        board_points_3d,
+                        corners_2d,
+                        cam.matrix,
+                        cam.dist,
+                        flags=cv2.SOLVEPNP_ITERATIVE
+                    )
+
+                    if success:
+                        detections_for_cam.append({
+                            'frame_idx': frame_idx,
+                            'corners_2d': corners_2d,
+                            'ids': ids,
+                            'rvec': rvec,
+                            'tvec': tvec,
+                            'n_corners': len(corners_2d)
+                        })
+                except cv2.error:
+                    pass
+
+            frame_idx += 1
+
+        cap.release()
+
+        if detections_for_cam:
+            all_detections[cam_idx] = detections_for_cam
+            print(f"    {cam_name}: {len(detections_for_cam)} detections")
+        else:
+            print(f"    {cam_name}: No detections")
+
+    return all_detections
+
+
+def transform_board_pose_to_world(
+    rvec_board_in_cam: np.ndarray,
+    tvec_board_in_cam: np.ndarray,
+    cam_rvec: np.ndarray,
+    cam_tvec: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Transform board pose from camera coordinates to world coordinates.
+
+    Parameters
+    ----------
+    rvec_board_in_cam : np.ndarray
+        Board rotation vector in camera coordinates (3, 1)
+    tvec_board_in_cam : np.ndarray
+        Board translation vector in camera coordinates (3, 1)
+    cam_rvec : np.ndarray
+        Camera rotation vector (world to camera) (3, 1)
+    cam_tvec : np.ndarray
+        Camera translation vector (world origin in camera coords) (3, 1)
+
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray]
+        - Board rotation vector in world coordinates (3, 1)
+        - Board translation vector in world coordinates (3, 1)
+    """
+    # Convert rotation vectors to matrices
+    R_cam, _ = cv2.Rodrigues(cam_rvec)  # Camera rotation: world to camera
+    R_board_in_cam, _ = cv2.Rodrigues(rvec_board_in_cam)  # Board rotation in camera frame
+
+    # Camera position in world coordinates
+    cam_position_world = -R_cam.T @ cam_tvec.flatten()
+
+    # Board rotation in world coordinates
+    R_board_world = R_cam.T @ R_board_in_cam
+
+    # Board position in world coordinates
+    board_position_cam = tvec_board_in_cam.flatten()
+    board_position_world = cam_position_world + R_cam.T @ board_position_cam
+
+    # Convert back to rotation vector
+    rvec_board_world, _ = cv2.Rodrigues(R_board_world)
+    tvec_board_world = board_position_world.reshape(3, 1)
+
+    return rvec_board_world, tvec_board_world
+
+
+def compute_board_reference_frame(
+    detections: dict,
+    camera_group: CameraGroup,
+    board
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute the board's reference frame in world coordinates from multiple detections.
+
+    Parameters
+    ----------
+    detections : dict
+        Dictionary from detect_board_in_final_frames()
+    camera_group : CameraGroup
+        Calibrated camera group
+    board : CharucoBoard
+        Board object
+
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray]
+        - board_position: Board center position in world coordinates (3,)
+        - board_rotation: Board rotation matrix in world coordinates (3, 3)
+          where Z-axis points upward from board, X/Y lie in board plane
+    """
+    board_positions = []
+    board_rotations = []
+
+    for cam_idx, cam_detections in detections.items():
+        cam = camera_group.cameras[cam_idx]
+
+        for detection in cam_detections:
+            # Transform board pose to world coordinates
+            rvec_world, tvec_world = transform_board_pose_to_world(
+                detection['rvec'],
+                detection['tvec'],
+                cam.rvec,
+                cam.tvec
+            )
+
+            board_positions.append(tvec_world.flatten())
+
+            R_board, _ = cv2.Rodrigues(rvec_world)
+            board_rotations.append(R_board)
+
+    if not board_positions:
+        raise ValueError("No valid board detections found for coordinate frame computation")
+
+    # Average board position
+    board_position_mean = np.mean(board_positions, axis=0)
+
+    # Average board orientation using SVD
+    # Stack rotation matrices and compute mean via SVD
+    R_stack = np.array(board_rotations)
+    R_mean = np.mean(R_stack, axis=0)
+
+    # Project to nearest rotation matrix using SVD
+    U, _, Vt = np.linalg.svd(R_mean)
+    R_board_mean = U @ Vt
+
+    # Ensure right-handed coordinate system
+    if np.linalg.det(R_board_mean) < 0:
+        Vt[-1, :] *= -1
+        R_board_mean = U @ Vt
+
+    # In ChArUco/OpenCV convention, the board coordinate frame has:
+    # - X-axis pointing right along the board
+    # - Y-axis pointing down along the board
+    # - Z-axis pointing OUT of the board (perpendicular)
+    #
+    # We want the final world frame to have:
+    # - XY plane coplanar with the board
+    # - Z-axis pointing UP (opposite to typical OpenCV board frame)
+    #
+    # So we need to flip the Z-axis
+    flip_matrix = np.diag([1, 1, -1])
+    R_board_flipped = R_board_mean @ flip_matrix
+
+    return board_position_mean, R_board_flipped
+
+
+def apply_coordinate_transform(
+    camera_group: CameraGroup,
+    translation: np.ndarray,
+    rotation: np.ndarray
+) -> CameraGroup:
+    """
+    Apply a coordinate transformation to all cameras in the group.
+
+    This transforms the world coordinate system by applying:
+    1. Rotation: R_new = R_transform @ R_old
+    2. Translation: t_new = R_transform @ t_old + t_transform
+
+    Parameters
+    ----------
+    camera_group : CameraGroup
+        Camera group to transform (modified in place)
+    translation : np.ndarray
+        Translation vector (3,) - shifts world origin
+    rotation : np.ndarray
+        Rotation matrix (3, 3) - rotates world axes
+
+    Returns
+    -------
+    CameraGroup
+        Transformed camera group (same object as input)
+    """
+    for cam in camera_group.cameras:
+        if cam.rvec is None or cam.tvec is None:
+            continue
+
+        # Convert camera rotation vector to matrix
+        R_cam, _ = cv2.Rodrigues(cam.rvec)
+
+        # Transform rotation: R_new = R_transform @ R_old
+        R_cam_new = rotation @ R_cam
+
+        # Transform translation: t_new = R_transform @ t_old + t_transform
+        tvec_old = cam.tvec.flatten()
+        tvec_new = rotation @ tvec_old + translation
+
+        # Convert back to rotation vector
+        rvec_new, _ = cv2.Rodrigues(R_cam_new)
+
+        # Update camera extrinsics
+        cam.set_rotation(rvec_new)
+        cam.set_translation(tvec_new.reshape(3, 1))
+
+    return camera_group
+
+
+def reorient_to_board_frame(
+    camera_group: CameraGroup,
+    video_lists: List[List[str]],
+    board,
+    duration_seconds: float = 3.0,
+    min_corners: int = 10,
+    verbose: bool = True
+) -> CameraGroup:
+    """
+    Reorient the coordinate frame so the origin is at the calibration board center
+    with the XY plane coplanar with the board and Z-axis pointing upward.
+
+    This function should be called after calibration is complete. It analyzes the
+    final frames of the calibration videos where the board is placed on the ground,
+    estimates the board's pose, and transforms the entire camera system to use the
+    board as the coordinate frame origin.
+
+    Parameters
+    ----------
+    camera_group : CameraGroup
+        Calibrated camera group (will be modified in place)
+    video_lists : List[List[str]]
+        List of video lists used for calibration (one per camera)
+    board : CharucoBoard
+        Board object used for calibration
+    duration_seconds : float, optional
+        Duration in seconds to analyze from end of videos (default: 3.0)
+    min_corners : int, optional
+        Minimum corners required per detection (default: 10)
+    verbose : bool, optional
+        Print progress information (default: True)
+
+    Returns
+    -------
+    CameraGroup
+        Transformed camera group (same object as input, modified in place)
+
+    Examples
+    --------
+    >>> # After calibration
+    >>> camera_group, results = run_calibration_pipeline('projects/calibration')
+    >>> # Reorient to board frame
+    >>> camera_group = reorient_to_board_frame(
+    ...     camera_group,
+    ...     video_lists,
+    ...     board,
+    ...     duration_seconds=3.0
+    ... )
+    """
+    if verbose:
+        print("\n  Reorienting coordinate frame to board placement...")
+        print(f"    Analyzing final {duration_seconds} seconds of videos")
+
+    # Step 1: Detect board in final frames
+    detections = detect_board_in_final_frames(
+        video_lists,
+        board,
+        camera_group,
+        duration_seconds=duration_seconds,
+        min_corners=min_corners
+    )
+
+    if not detections:
+        raise ValueError(
+            f"No board detections found in final {duration_seconds}s of videos. "
+            "Ensure the board is visible to multiple cameras in the final frames."
+        )
+
+    total_detections = sum(len(dets) for dets in detections.values())
+    if verbose:
+        print(f"    Total detections: {total_detections} across {len(detections)} cameras")
+
+    # Step 2: Compute board reference frame in current world coordinates
+    if verbose:
+        print("    Computing board reference frame...")
+
+    board_position, board_rotation = compute_board_reference_frame(
+        detections,
+        camera_group,
+        board
+    )
+
+    if verbose:
+        print(f"    Board center (old frame): [{board_position[0]:.2f}, "
+              f"{board_position[1]:.2f}, {board_position[2]:.2f}]")
+
+    # Step 3: Compute transformation to new coordinate frame
+    # We want: new_origin = board_center, new_axes = board_axes
+    # Transformation: p_new = R_transform @ (p_old - board_position)
+    # Equivalently for camera extrinsics:
+    # - R_cam_new = R_transform @ R_cam_old
+    # - t_cam_new = R_transform @ t_cam_old - R_transform @ board_position
+    #
+    # Where R_transform rotates from old world frame to new board frame
+    # R_transform = R_board^T (inverse rotation)
+
+    R_transform = board_rotation.T  # Inverse of board rotation
+    t_transform = -R_transform @ board_position
+
+    if verbose:
+        print("    Applying transformation to all cameras...")
+
+    # Step 4: Apply transformation
+    apply_coordinate_transform(camera_group, t_transform, R_transform)
+
+    if verbose:
+        print("    Reorientation complete!")
+        print("      Origin: board center | XY plane: board plane | Z axis: upward")
+
+    return camera_group
+
+
+# ============================================================================
+# 10. Pipeline Orchestration
 # ============================================================================
 
 DEFAULT_VIZ_CONFIG = {
     'extrinsics_output': None,
     'heatmap_output': None,
     'frustum_scale': 200,
-    'max_frames': 500,
+    'frame_step': 10,  # Sample every 10th frame by default
     'show_axes': True,
     'show_labels': True,
     'extrinsics_figsize': (14, 12),
@@ -1317,6 +1768,8 @@ def run_calibration_pipeline(
     config_path: Optional[str] = None,
     generate_board_image: bool = True,
     generate_visualizations: bool = True,
+    reorient_to_board: bool = False,
+    reorient_duration_seconds: float = 3.0,
     visualization_config: Optional[dict] = None,
     video_extension: Optional[str] = None,
     verbose: bool = True,
@@ -1478,15 +1931,17 @@ def run_calibration_pipeline(
         print("  This may take 10-20 minutes depending on video length and number of cameras...")
 
     fisheye = config.get('calibration', {}).get('fisheye', False)
-    camera_group = calibrate_cameras(
+    camera_group, bundle_error = calibrate_cameras(
         video_lists=video_lists,
         board=board,
         cam_names=cam_names,
         fisheye=fisheye,
         verbose=verbose
     )
+    results['bundle_adjustment_error'] = bundle_error
     if verbose:
         print("   Calibration complete")
+        print(f"   Bundle adjustment error: {bundle_error:.4f} pixels")
 
     # Step 7/8: Validate and save
     if verbose:
@@ -1511,20 +1966,86 @@ def run_calibration_pipeline(
     if verbose:
         print(f"\n   Saved calibration to {calib_output}")
 
+    # Merge visualization config to get frame_step parameter
+    viz_config = _merge_visualization_config(visualization_config, project_folder)
+    validation_frame_step = viz_config.get('frame_step', 10)
+
+    # Compute per-frame validation error (will be reused for heatmap if visualizations enabled)
+    if verbose:
+        print(f"  Computing per-frame validation error (sampling every {validation_frame_step}th frame)...")
+    try:
+        error_matrix, camera_names_list, frame_indices = compute_reprojection_errors_per_frame(
+            camera_group, video_lists, board, frame_step=validation_frame_step
+        )
+        # Compute overall mean error from all valid measurements
+        valid_errors = error_matrix[~np.isnan(error_matrix)]
+        per_frame_validation_error = valid_errors.mean() if len(valid_errors) > 0 else None
+        if verbose and per_frame_validation_error is not None:
+            print(f"   Per-frame validation error: {per_frame_validation_error:.4f} pixels")
+
+        # Store for reuse in visualization to avoid redundant computation
+        precomputed_errors = (error_matrix, camera_names_list, frame_indices)
+    except Exception as e:
+        if verbose:
+            print(f"   Warning: Failed to compute per-frame validation error: {e}")
+        per_frame_validation_error = None
+        precomputed_errors = None
+
     # Save calibration summary
     summary_path = project_path / 'output' / 'calibration_summary.txt'
-    save_calibration_summary(camera_group, config, str(summary_path))
+    save_calibration_summary(
+        camera_group,
+        config,
+        str(summary_path),
+        bundle_adjustment_error=bundle_error,
+        per_frame_validation_error=per_frame_validation_error
+    )
     results['summary_path'] = str(summary_path)
     if verbose:
         print(f"   Saved calibration summary to {summary_path}")
+
+    # Optional: Reorient to board frame
+    if reorient_to_board:
+        if verbose:
+            print("\n[7b/8] Reorienting coordinate frame to board placement...")
+
+        # Make a deep copy of camera extrinsics before reorienting
+        # (intrinsics remain the same, only extrinsics change)
+        import copy
+        camera_group_backup = copy.deepcopy(camera_group)
+
+        try:
+            # Reorient the camera group
+            reorient_to_board_frame(
+                camera_group,
+                video_lists,
+                board,
+                duration_seconds=reorient_duration_seconds,
+                verbose=verbose
+            )
+
+            # Save reoriented calibration to separate file
+            calib_reoriented_output = project_path / 'calibration_reoriented.toml'
+            camera_group.dump(str(calib_reoriented_output))
+            results['calibration_reoriented_path'] = str(calib_reoriented_output)
+
+            if verbose:
+                print(f"   Saved reoriented calibration to {calib_reoriented_output}")
+
+        except Exception as e:
+            if verbose:
+                print(f"   Warning: Reorientation failed: {e}")
+                print("   Proceeding with original calibration for visualizations")
+            # Restore original calibration if reorientation failed
+            camera_group = camera_group_backup
+            results['calibration_reoriented_path'] = None
+    else:
+        results['calibration_reoriented_path'] = None
 
     # Step 8/8: Generate visualizations (optional)
     if generate_visualizations:
         if verbose:
             print("\n[8/8] Generating visualizations...")
-
-        # Merge visualization config
-        viz_config = _merge_visualization_config(visualization_config, project_folder)
 
         # Create output directory
         viz_dir = Path(viz_config['extrinsics_output']).parent
@@ -1550,7 +2071,7 @@ def run_calibration_pipeline(
                 print(f"   Warning: Failed to generate extrinsics plot: {e}")
             results['extrinsics_plot_path'] = None
 
-        # Generate reprojection error heatmap
+        # Generate reprojection error heatmap (reuse precomputed errors)
         if verbose:
             print("  Generating reprojection error heatmap...")
         try:
@@ -1559,7 +2080,8 @@ def run_calibration_pipeline(
                 video_lists,
                 board,
                 output_path=viz_config['heatmap_output'],
-                max_frames=viz_config['max_frames'],
+                frame_step=validation_frame_step,
+                precomputed_errors=precomputed_errors,  # Reuse computation from summary
                 figsize=viz_config['heatmap_figsize']
             )
             results['heatmap_plot_path'] = viz_config['heatmap_output']
