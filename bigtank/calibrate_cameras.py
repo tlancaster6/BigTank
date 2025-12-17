@@ -405,8 +405,11 @@ def calibrate_cameras(
     )
 
     # calibrate_videos returns the final bundle adjustment error
+    # Handle both single value and tuple return (depending on aniposelib version)
     if bundle_error is None:
         bundle_error = 0.0
+    elif isinstance(bundle_error, tuple):
+        bundle_error = bundle_error[0]  # Extract first element if tuple
 
     return cgroup, bundle_error
 
@@ -1768,7 +1771,7 @@ def run_calibration_pipeline(
     config_path: Optional[str] = None,
     generate_board_image: bool = True,
     generate_visualizations: bool = True,
-    reorient_to_board: bool = False,
+    reorient_to_board: bool = True,
     reorient_duration_seconds: float = 3.0,
     visualization_config: Optional[dict] = None,
     video_extension: Optional[str] = None,
