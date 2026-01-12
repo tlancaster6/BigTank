@@ -121,7 +121,7 @@ COORDINATE FRAMES
      * OpenCV 4.6.0+ with CW ordering: Z points INTO board (perpendicular to board, away from viewer)
      * Pre-4.6.0: Z pointed OUT of board (toward viewer)
    - For boards on ground with overhead cameras (OpenCV 4.6.0+):
-     Z points downward (into ground, away from cameras above)
+     Z points downward (upwards from ground, towards cameras above)
 
 3. CALIBRATION WORLD FRAME:
    - Arbitrary frame established during calibration
