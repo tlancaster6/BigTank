@@ -1,4 +1,4 @@
-# BigTank
+# BigTankCalib
 
 Multi-camera calibration pipeline for overhead camera arrays using ChArUco boards. Built on aniposelib with enhanced 
 error metrics, ground-plane reorientation, and comprehensive visualization tools. Calibration outputs in aniposelib
