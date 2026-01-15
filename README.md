@@ -16,25 +16,7 @@ cannot be seen by every camera simultaneously).
 ## Installation
 
 ```bash
-pip install aniposelib opencv-python numpy matplotlib toml
-```
-
-For Python 3.11+, `tomllib` is built-in. For earlier versions, install `toml`.
-
-## Quick Start
-
-```bash
-# Run calibration with default settings
-python main.py projects/calibration_121525
-
-# Skip visualizations for faster processing
-python main.py projects/calibration_121525 --no-visualizations
-
-# Adjust frame sampling for error analysis
-python main.py projects/calibration_121525 --frame-step 5
-
-# Quiet mode with no board image
-python main.py projects/calibration_121525 --quiet --no-board-image
+pip install -r requirements.txt
 ```
 
 ## Usage
@@ -306,9 +288,9 @@ translation = [-287.56, 93.46, 1707.24]  # Arbitrary world frame
 - Run without `--no-visualizations` flag
 - Check console output for specific error messages
 
-## Citation
+## Citations
 
-This implementation builds on aniposelib:
+This implementation builds heavily on aniposelib:
 
 ```
 @software{karashchuk2021anipose,
@@ -318,6 +300,11 @@ This implementation builds on aniposelib:
   year = {2021}
 }
 ```
+
+## Acknowledgements
+
+This repository was developed as part of a project funded in part by NIH Grant R34 DA059510 awarded to Dr. 
+Patrick McGrath, Georgia Institute of Technology
 
 ## License
 
