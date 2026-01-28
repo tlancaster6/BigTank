@@ -13,7 +13,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from bigtank.calibrate_cameras import run_calibration_pipeline
+from bigtank.pipeline import run_calibration_pipeline
 
 
 def main():
