@@ -655,3 +655,158 @@ def plot_reprojection_error_heatmap(
         print(f"Saved reprojection error heatmap to: {output_path}")
 
     return fig
+
+
+def plot_distance_error_cross_sections(
+    distance_validation: dict,
+    camera_group: CameraGroup,
+    output_path: Optional[str] = None,
+    slab_thickness: float = 100.0,
+    figsize: Tuple[int, int] = (16, 12)
+) -> plt.Figure:
+    """
+    Plot spatial cross-sections of 3D distance validation errors.
+
+    Slab positions are derived from the data bounding box:
+    - XZ slab: centered on data centroid Y, 100mm thick
+    - YZ slab: centered on data centroid X, 100mm thick
+    - XY slab (deep): bottom of Z range, 100mm thick
+    - XY slab (shallow): top of Z range, 100mm thick
+
+    Parameters
+    ----------
+    distance_validation : dict
+        Output from compute_distance_validation(), must contain
+        'midpoints_3d' and 'per_frame_errors'
+    camera_group : CameraGroup
+        Calibrated camera group (for camera position overlay)
+    output_path : str, optional
+        Path to save the figure
+    slab_thickness : float, optional
+        Thickness of each slab in mm (default: 100.0)
+    figsize : tuple, optional
+        Figure size (width, height) in inches (default: (16, 12))
+
+    Returns
+    -------
+    plt.Figure
+        Matplotlib figure object
+    """
+    midpoints = distance_validation['midpoints_3d']
+    errors = np.array(distance_validation['per_frame_errors'])
+
+    if len(midpoints) == 0:
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        ax.text(0.5, 0.5, 'No distance measurements available',
+                ha='center', va='center', transform=ax.transAxes, fontsize=14)
+        if output_path:
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        return fig
+
+    # Get camera positions for overlay
+    cam_positions = []
+    cam_names = []
+    for cam in camera_group.cameras:
+        if cam.rvec is not None and cam.tvec is not None:
+            R, _ = cv2.Rodrigues(cam.rvec)
+            pos = -R.T @ cam.tvec.flatten()
+            cam_positions.append(pos)
+            cam_names.append(cam.get_name())
+    cam_positions = np.array(cam_positions) if cam_positions else np.empty((0, 3))
+
+    # Compute data-driven slab positions
+    centroid = midpoints.mean(axis=0)
+    z_min = midpoints[:, 2].min()
+    z_max = midpoints[:, 2].max()
+    half = slab_thickness / 2.0
+
+    # XZ and YZ slabs centered on data centroid; XY slabs at bottom and top of Z range
+    xz_y_lo = centroid[1] - half
+    xz_y_hi = centroid[1] + half
+    yz_x_lo = centroid[0] - half
+    yz_x_hi = centroid[0] + half
+    xy_deep_lo = z_min
+    xy_deep_hi = z_min + slab_thickness
+    xy_shallow_lo = z_max - slab_thickness
+    xy_shallow_hi = z_max
+
+    # Define slabs: (title, slice_axis, slice_min, slice_max, horiz_axis, vert_axis, h_label, v_label)
+    # axis indices: X=0, Y=1, Z=2
+    slabs = [
+        (f'XZ cross-section (Y = {xz_y_lo:.0f} to {xz_y_hi:.0f} mm)',
+         1, xz_y_lo, xz_y_hi, 0, 2, 'X (mm)', 'Z (mm)'),
+        (f'YZ cross-section (X = {yz_x_lo:.0f} to {yz_x_hi:.0f} mm)',
+         0, yz_x_lo, yz_x_hi, 1, 2, 'Y (mm)', 'Z (mm)'),
+        (f'XY cross-section, deep (Z = {xy_deep_lo:.0f} to {xy_deep_hi:.0f} mm)',
+         2, xy_deep_lo, xy_deep_hi, 0, 1, 'X (mm)', 'Y (mm)'),
+        (f'XY cross-section, shallow (Z = {xy_shallow_lo:.0f} to {xy_shallow_hi:.0f} mm)',
+         2, xy_shallow_lo, xy_shallow_hi, 0, 1, 'X (mm)', 'Y (mm)'),
+    ]
+
+    # Symmetric colormap range centered on zero
+    vlim = np.percentile(np.abs(errors), 95)
+    vmin = -vlim
+    vmax = vlim
+
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    axes_flat = axes.flatten()
+
+    for idx, (title, sl_ax, sl_min, sl_max, h_ax, v_ax, h_label, v_label) in enumerate(slabs):
+        ax = axes_flat[idx]
+
+        # Select points within slab
+        mask = (midpoints[:, sl_ax] >= sl_min) & (midpoints[:, sl_ax] <= sl_max)
+        slab_pts = midpoints[mask]
+        slab_errs = errors[mask]
+
+        if len(slab_errs) > 0:
+            hb = ax.hexbin(
+                slab_pts[:, h_ax], slab_pts[:, v_ax],
+                C=slab_errs, reduce_C_function=np.mean,
+                gridsize=20, cmap='RdBu_r', vmin=vmin, vmax=vmax,
+                mincnt=1
+            )
+        else:
+            # Empty plot — still need a mappable for the shared colorbar
+            ax.scatter([], [], c=[], cmap='RdBu_r', vmin=vmin, vmax=vmax)
+
+        # Overlay camera positions only on XY slabs (not XZ/YZ where they dominate the view)
+        if len(cam_positions) > 0 and v_ax != 2:
+            ax.scatter(
+                cam_positions[:, h_ax], cam_positions[:, v_ax],
+                c='blue', marker='^', s=80, edgecolors='black', linewidths=1,
+                zorder=10, label='Cameras'
+            )
+            for i, name in enumerate(cam_names):
+                ax.annotate(name, (cam_positions[i, h_ax], cam_positions[i, v_ax]),
+                           fontsize=6, ha='center', va='bottom', color='blue')
+
+        ax.set_xlabel(h_label, fontsize=10)
+        ax.set_ylabel(v_label, fontsize=10)
+        ax.set_title(f'{title}\n(n={len(slab_errs)})', fontsize=10, fontweight='bold')
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+
+        # Z increases upward for cross-sections with Z on vertical axis
+        if v_ax == 2:
+            ax.invert_yaxis()
+
+    # Shared colorbar
+    fig.subplots_adjust(right=0.88, hspace=0.35, wspace=0.30)
+    cbar_ax = fig.add_axes([0.90, 0.15, 0.02, 0.7])
+    cbar = fig.colorbar(plt.cm.ScalarMappable(
+        norm=plt.Normalize(vmin=vmin, vmax=vmax), cmap='RdBu_r'
+    ), cax=cbar_ax)
+    cbar.set_label('Signed distance error (mm)\n(+ = overestimate, \u2212 = underestimate)', fontsize=10)
+
+    fig.suptitle('3D Distance Error Cross-Sections', fontsize=14, fontweight='bold', y=0.98)
+
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"Saved distance error cross-sections to: {output_path}")
+
+    return fig

@@ -364,12 +364,245 @@ def compute_reprojection_error(camera_group: CameraGroup, points_2d, points_3d) 
     return error
 
 
+def _get_adjacent_corner_pairs(board) -> List[Tuple[int, int]]:
+    """
+    Get list of adjacent corner pairs (horizontal and vertical neighbors) for a CharucoBoard.
+
+    CharucoBoard interior corners are numbered row by row, with:
+    - n_cols = squaresX - 1 corners per row
+    - n_rows = squaresY - 1 rows of corners
+
+    Parameters
+    ----------
+    board : CharucoBoard
+        The charuco board object
+
+    Returns
+    -------
+    List[Tuple[int, int]]
+        List of (corner_id_1, corner_id_2) tuples for adjacent corners
+    """
+    # Get board dimensions
+    # CharucoBoard has squaresX x squaresY squares, giving (squaresX-1) x (squaresY-1) interior corners
+    squares_x = board.squaresX
+    squares_y = board.squaresY
+    n_cols = squares_x - 1  # corners per row
+    n_rows = squares_y - 1  # number of rows of corners
+
+    pairs = []
+
+    for row in range(n_rows):
+        for col in range(n_cols):
+            corner_id = row * n_cols + col
+
+            # Horizontal neighbor (same row, next column)
+            if col < n_cols - 1:
+                neighbor_id = corner_id + 1
+                pairs.append((corner_id, neighbor_id))
+
+            # Vertical neighbor (next row, same column)
+            if row < n_rows - 1:
+                neighbor_id = corner_id + n_cols
+                pairs.append((corner_id, neighbor_id))
+
+    return pairs
+
+
+def compute_distance_validation(
+    camera_group: CameraGroup,
+    video_lists: List[List[str]],
+    board,
+    square_length: float,
+    frame_step: int = 10
+) -> dict:
+    """
+    Compute 3D distance validation by comparing triangulated corner distances to ground truth.
+
+    This metric measures 3D reconstruction accuracy by:
+    1. Triangulating charuco corner positions from multi-camera views
+    2. Computing Euclidean distances between adjacent corners
+    3. Comparing measured distances to known ground truth (square_length)
+
+    Parameters
+    ----------
+    camera_group : CameraGroup
+        Calibrated camera group
+    video_lists : List[List[str]]
+        Nested list of video paths per camera
+    board : CharucoBoard
+        Board object for corner detection
+    square_length : float
+        Ground truth distance between adjacent corners in mm
+    frame_step : int, optional
+        Sample every Nth frame (default: 10)
+
+    Returns
+    -------
+    dict
+        Dictionary containing:
+        - 'mean_absolute_error_mm': Mean absolute error in mm
+        - 'rmse_mm': Root mean squared error in mm
+        - 'mean_signed_error_mm': Bias (+ = overestimate, - = underestimate)
+        - 'std_error_mm': Standard deviation of errors
+        - 'percent_error': (MAE / square_length) * 100
+        - 'n_measurements': Total number of distance measurements
+        - 'n_frames': Number of frames with valid measurements
+        - 'per_frame_errors': List of all individual errors for distribution analysis
+    """
+    # Get adjacent corner pairs for this board
+    adjacent_pairs = _get_adjacent_corner_pairs(board)
+
+    # Open video captures
+    n_cameras = len(video_lists)
+    caps = [cv2.VideoCapture(video_lists[i][0]) for i in range(n_cameras)]
+
+    # Get video properties
+    total_frames = int(caps[0].get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Collect all distance errors and 3D midpoints
+    all_errors = []
+    all_midpoints = []
+    n_frames_with_measurements = 0
+
+    frame_idx = 0
+    while frame_idx < total_frames:
+        # Read frames from all cameras
+        frames = []
+        all_valid = True
+        for cap in caps:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                all_valid = False
+                break
+            frames.append(frame)
+
+        if not all_valid:
+            frame_idx += frame_step
+            continue
+
+        # Detect charuco corners in each camera
+        all_corners = {}  # corner_id -> list of (camera_idx, 2d_point)
+        for cam_idx, frame in enumerate(frames):
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            # Detect charuco corners using aniposelib's detect_image method
+            detections = board.detect_image(gray)
+            if detections is None:
+                continue
+
+            # Handle tuple output (corners, ids) from detect_image
+            if isinstance(detections, tuple):
+                charuco_corners, charuco_ids = detections
+                if charuco_corners is None or len(charuco_corners) == 0:
+                    continue
+                charuco_corners = charuco_corners.reshape(-1, 2)
+                charuco_ids = charuco_ids.flatten()
+            else:
+                # Handle array output where columns are [x, y, corner_id, ...]
+                if len(detections) == 0:
+                    continue
+                charuco_corners = detections[:, :2]
+                charuco_ids = detections[:, 2].astype(int)
+
+            # Store detected corners
+            for i, corner_id in enumerate(charuco_ids):
+                if corner_id not in all_corners:
+                    all_corners[corner_id] = []
+                all_corners[corner_id].append((cam_idx, charuco_corners[i]))
+
+        # Triangulate corners visible in at least 2 cameras
+        triangulated_corners = {}  # corner_id -> 3D point
+
+        for corner_id, detections in all_corners.items():
+            if len(detections) < 2:
+                continue
+
+            # Build 2D points array for triangulation (n_cameras x 2)
+            points_2d = np.full((n_cameras, 2), np.nan)
+            for cam_idx, point_2d in detections:
+                points_2d[cam_idx] = point_2d
+
+            # Triangulate using camera_group (expects shape: n_cameras x n_points x 2)
+            point_3d = camera_group.triangulate(points_2d.reshape(n_cameras, 1, 2))[0]
+
+            # Check for valid triangulation (not NaN or inf)
+            if not np.any(np.isnan(point_3d)) and not np.any(np.isinf(point_3d)):
+                triangulated_corners[corner_id] = point_3d
+
+        # Compute distances between adjacent triangulated corners
+        frame_has_measurements = False
+        for id1, id2 in adjacent_pairs:
+            if id1 in triangulated_corners and id2 in triangulated_corners:
+                p1 = triangulated_corners[id1]
+                p2 = triangulated_corners[id2]
+                measured_distance = np.linalg.norm(p2 - p1)
+                error = measured_distance - square_length
+                all_errors.append(error)
+                all_midpoints.append((p1 + p2) / 2.0)
+                frame_has_measurements = True
+
+        if frame_has_measurements:
+            n_frames_with_measurements += 1
+
+        frame_idx += frame_step
+
+    # Release video captures
+    for cap in caps:
+        cap.release()
+
+    # Compute statistics
+    if len(all_errors) == 0:
+        return {
+            'mean_absolute_error_mm': np.nan,
+            'rmse_mm': np.nan,
+            'mean_signed_error_mm': np.nan,
+            'std_error_mm': np.nan,
+            'percent_error': np.nan,
+            'min_error_mm': np.nan,
+            'q1_error_mm': np.nan,
+            'median_error_mm': np.nan,
+            'q3_error_mm': np.nan,
+            'max_error_mm': np.nan,
+            'n_measurements': 0,
+            'n_frames': 0,
+            'per_frame_errors': [],
+            'midpoints_3d': np.empty((0, 3)),
+        }
+
+    errors_array = np.array(all_errors)
+    abs_errors = np.abs(errors_array)
+    mae = np.mean(abs_errors)
+    rmse = np.sqrt(np.mean(errors_array ** 2))
+    mean_signed = np.mean(errors_array)
+    std_error = np.std(errors_array)
+    percent_error = (mae / square_length) * 100
+
+    return {
+        'mean_absolute_error_mm': mae,
+        'rmse_mm': rmse,
+        'mean_signed_error_mm': mean_signed,
+        'std_error_mm': std_error,
+        'percent_error': percent_error,
+        'min_error_mm': float(np.min(errors_array)),
+        'q1_error_mm': float(np.percentile(errors_array, 25)),
+        'median_error_mm': float(np.median(errors_array)),
+        'q3_error_mm': float(np.percentile(errors_array, 75)),
+        'max_error_mm': float(np.max(errors_array)),
+        'n_measurements': len(all_errors),
+        'n_frames': n_frames_with_measurements,
+        'per_frame_errors': all_errors,
+        'midpoints_3d': np.array(all_midpoints),
+    }
+
+
 def save_calibration_summary(
     camera_group: CameraGroup,
     config: dict,
     output_path: str,
     bundle_adjustment_error: Optional[float] = None,
-    per_frame_validation_error: Optional[float] = None
+    per_frame_validation_error: Optional[float] = None,
+    distance_validation: Optional[dict] = None
 ) -> None:
     """
     Save formatted calibration summary to text file.
@@ -386,6 +619,8 @@ def save_calibration_summary(
         Bundle adjustment reprojection error from calibration (pixels)
     per_frame_validation_error : float, optional
         Per-frame validation reprojection error using RANSAC (pixels)
+    distance_validation : dict, optional
+        Distance validation metrics from compute_distance_validation()
     """
     from datetime import datetime
 
@@ -486,6 +721,36 @@ def save_calibration_summary(
                 quality = "Poor - consider recalibration"
             lines.append(f"Quality assessment:           {quality}")
             lines.append("")
+
+    # 3D Distance Validation section
+    if distance_validation is not None and distance_validation.get('n_measurements', 0) > 0:
+        lines.append("-" * 70)
+        lines.append("3D DISTANCE VALIDATION (Ground Truth Comparison)")
+        lines.append("-" * 70)
+        lines.append(f"Ground truth square length:   {calib_params['square_length']:.2f} mm")
+        lines.append(f"Mean absolute error:          {distance_validation['mean_absolute_error_mm']:.2f} mm ({distance_validation['percent_error']:.1f}%)")
+        lines.append(f"RMSE:                         {distance_validation['rmse_mm']:.2f} mm")
+
+        # Format signed error with +/- and bias description
+        signed_error = distance_validation['mean_signed_error_mm']
+        if signed_error >= 0:
+            bias_desc = "bias toward overestimate"
+            signed_str = f"+{signed_error:.2f}"
+        else:
+            bias_desc = "bias toward underestimate"
+            signed_str = f"{signed_error:.2f}"
+        lines.append(f"Mean signed error:            {signed_str} mm ({bias_desc})")
+
+        lines.append(f"Standard deviation:           {distance_validation['std_error_mm']:.2f} mm")
+        lines.append(f"Error distribution (mm):      "
+                     f"min={distance_validation['min_error_mm']:.2f}  "
+                     f"Q1={distance_validation['q1_error_mm']:.2f}  "
+                     f"median={distance_validation['median_error_mm']:.2f}  "
+                     f"Q3={distance_validation['q3_error_mm']:.2f}  "
+                     f"max={distance_validation['max_error_mm']:.2f}")
+        lines.append(f"Total measurements:           {distance_validation['n_measurements']}")
+        lines.append(f"Frames analyzed:              {distance_validation['n_frames']}")
+        lines.append("")
 
     lines.append("=" * 70)
 

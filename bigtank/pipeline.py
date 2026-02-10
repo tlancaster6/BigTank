@@ -26,10 +26,12 @@ from .calibration import (
     save_calibration,
     validate_calibration,
     save_calibration_summary,
+    compute_distance_validation,
 )
 from .visualization import (
     plot_camera_extrinsics,
     plot_reprojection_error_heatmap,
+    plot_distance_error_cross_sections,
     compute_reprojection_errors_per_frame,
 )
 from .coordinates import reorient_to_board_frame
@@ -313,6 +315,29 @@ def run_calibration_pipeline(
         per_frame_validation_error = None
         precomputed_errors = None
 
+    # Compute 3D distance validation (ground truth comparison)
+    if verbose:
+        print(f"  Computing 3D distance validation (sampling every {validation_frame_step}th frame)...")
+    try:
+        square_length = config.get('calibration', {}).get('board_square_side_length', 60.0)
+        distance_validation = compute_distance_validation(
+            camera_group,
+            video_lists,
+            board,
+            square_length=square_length,
+            frame_step=validation_frame_step
+        )
+        results['distance_validation'] = distance_validation
+        if verbose and distance_validation.get('n_measurements', 0) > 0:
+            print(f"   Mean absolute error: {distance_validation['mean_absolute_error_mm']:.2f} mm ({distance_validation['percent_error']:.1f}%)")
+            print(f"   RMSE: {distance_validation['rmse_mm']:.2f} mm")
+            print(f"   Measurements: {distance_validation['n_measurements']} from {distance_validation['n_frames']} frames")
+    except Exception as e:
+        if verbose:
+            print(f"   Warning: Failed to compute distance validation: {e}")
+        distance_validation = None
+        results['distance_validation'] = None
+
     # Save calibration summary
     summary_path = project_path / 'output' / 'calibration_summary.txt'
     save_calibration_summary(
@@ -320,7 +345,8 @@ def run_calibration_pipeline(
         config,
         str(summary_path),
         bundle_adjustment_error=bundle_error,
-        per_frame_validation_error=per_frame_validation_error
+        per_frame_validation_error=per_frame_validation_error,
+        distance_validation=distance_validation
     )
     results['summary_path'] = str(summary_path)
     if verbose:
@@ -412,11 +438,33 @@ def run_calibration_pipeline(
             if verbose:
                 print(f"   Warning: Failed to generate error heatmap: {e}")
             results['heatmap_plot_path'] = None
+
+        # Generate distance error cross-section plot
+        if distance_validation is not None and distance_validation.get('n_measurements', 0) > 0:
+            if verbose:
+                print("  Generating distance error cross-section plot...")
+            try:
+                cross_section_path = str(viz_dir / 'distance_error_cross_sections.png')
+                plot_distance_error_cross_sections(
+                    distance_validation,
+                    camera_group,
+                    output_path=cross_section_path
+                )
+                results['cross_section_plot_path'] = cross_section_path
+                if verbose:
+                    print(f"   Saved to {cross_section_path}")
+            except Exception as e:
+                if verbose:
+                    print(f"   Warning: Failed to generate cross-section plot: {e}")
+                results['cross_section_plot_path'] = None
+        else:
+            results['cross_section_plot_path'] = None
     else:
         if verbose:
             print("\n[8/8] Skipping visualization generation")
         results['extrinsics_plot_path'] = None
         results['heatmap_plot_path'] = None
+        results['cross_section_plot_path'] = None
 
     if verbose:
         print("\n" + "=" * 60)
